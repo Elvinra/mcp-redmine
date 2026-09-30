@@ -2,7 +2,7 @@ import os, yaml, pathlib, json, uuid
 from urllib.parse import urljoin
 
 import httpx
-from mcp.server.mcpserver import MCPServer, Image
+from mcp.server.mcpserver import Context, MCPServer, Image
 from mcp.server.mcpserver.utilities.logging import get_logger
 
 ### Constants ###
@@ -16,7 +16,22 @@ with open(current_dir / 'redmine_openapi.yml') as f:
 
 # Constants from environment
 REDMINE_URL = os.environ['REDMINE_URL'].rstrip('/') + '/'  # Normalize to always end with /
-REDMINE_API_KEY = os.environ['REDMINE_API_KEY']
+# API key. Per-user over HTTP: each caller sends their own key in a request header, so one shared
+# streamable-http deployment can serve a whole org. REDMINE_API_KEY remains the fallback, and is the
+# only source on stdio, where there are no request headers. See resolve_api_key().
+REDMINE_API_KEY = os.environ.get('REDMINE_API_KEY', '')
+
+# Request headers checked, in order, for a per-user API key. Authorization is included because many MCP
+# clients only let you set that one; a "Bearer " prefix is stripped from whichever header carries the key.
+REDMINE_API_KEY_HEADERS = [h.strip() for h in
+                           os.environ.get('REDMINE_API_KEY_HEADERS',
+                                          'X-Redmine-API-Key,Authorization').split(',') if h.strip()]
+
+# Refuse calls that carry no per-user key instead of falling back to REDMINE_API_KEY (enabled when set to
+# "1"). On a shared server that fallback means a client which forgets the header silently acts as the
+# operator's Redmine account; set this to require every user to present their own key.
+REDMINE_REQUIRE_USER_API_KEY = os.environ.get('REDMINE_REQUIRE_USER_API_KEY') == '1'
+
 REDMINE_RESPONSE_FORMAT = os.environ.get('REDMINE_RESPONSE_FORMAT', 'yaml').lower()
 
 # Custom headers (format: "Header1: Value1, Header2: Value2")
@@ -68,15 +83,72 @@ else:
     REDMINE_REQUEST_INSTRUCTIONS = ""
 
 
+NO_API_KEY_ERROR = ("No Redmine API key available: send one in a request header "
+                    "(REDMINE_API_KEY_HEADERS) or set the REDMINE_API_KEY environment variable")
+
+BEARER_PREFIX = 'bearer '
+
+
+def resolve_api_key(ctx: Context | None = None) -> tuple[str, str]:
+    """Resolve the Redmine API key to use for a single tool call.
+
+    Per-user first: on the HTTP transports every message carries the calling user's own headers, so one
+    deployment can serve many users with their own Redmine identities. Falls back to REDMINE_API_KEY,
+    which is the only source on stdio.
+
+    Returns (api_key, error) with exactly one of the two non-empty.
+    """
+    # ctx.headers is None on stdio, and the property raises when there is no active request (e.g. a
+    # tool function called directly from tests).
+    try:
+        headers = ctx.headers if ctx is not None else None
+    except Exception:
+        headers = None
+
+    if headers:
+        # Header mappings are case-insensitive on the HTTP transports, but don't depend on that.
+        lookup = {name.lower(): value for name, value in headers.items()}
+        for name in REDMINE_API_KEY_HEADERS:
+            key = (lookup.get(name.lower()) or '').strip()
+            if key[:len(BEARER_PREFIX)].lower() == BEARER_PREFIX:
+                key = key[len(BEARER_PREFIX):].strip()
+            if not key:
+                continue
+            # Header values are client-controlled: never forward one that could break out of the
+            # outgoing X-Redmine-API-Key header.
+            if not key.isprintable() or any(c.isspace() for c in key):
+                return '', f"Malformed API key in the {name} header: expected a bare Redmine API key"
+            return key, ''
+
+    if REDMINE_REQUIRE_USER_API_KEY:
+        return '', ("No API key in the request and REDMINE_REQUIRE_USER_API_KEY is enabled: send your own "
+                    "Redmine API key in one of these headers: "
+                    f"{', '.join(REDMINE_API_KEY_HEADERS) or '(none configured)'}")
+
+    return (REDMINE_API_KEY, '') if REDMINE_API_KEY else ('', NO_API_KEY_ERROR)
+
+
 # Core
 def request(path: str, method: str = 'get', data: dict = None, params: dict = None,
-            content_type: str = 'application/json', content: bytes = None, raw: bool = False) -> dict:
+            content_type: str = 'application/json', content: bytes = None, raw: bool = False,
+            api_key: str = None) -> dict:
     if REDMINE_READ_ONLY and method.lower() != 'get':
         return {"status_code": 0, "body": None,
                 "error": f"REDMINE_READ_ONLY is enabled: refusing {method.upper()} request"}
 
+    # api_key is the calling user's key (see resolve_api_key). None means "fall back to the configured
+    # key", which REDMINE_REQUIRE_USER_API_KEY forbids: on a shared server no call may quietly borrow the
+    # operator's Redmine account.
+    if not api_key and REDMINE_REQUIRE_USER_API_KEY:
+        return {"status_code": 0, "body": None,
+                "error": "REDMINE_REQUIRE_USER_API_KEY is enabled: refusing a request with no per-user API key"}
+
+    api_key = api_key or REDMINE_API_KEY
+    if not api_key:
+        return {"status_code": 0, "body": None, "error": NO_API_KEY_ERROR}
+
     headers = {
-        'X-Redmine-API-Key': REDMINE_API_KEY,
+        'X-Redmine-API-Key': api_key,
         'Content-Type': content_type,
         **REDMINE_HEADERS
     }
@@ -136,6 +208,11 @@ def wrap_insecure_content(content: str) -> str:
     return f"<insecure-content-{tag_id}>\n{content}\n</insecure-content-{tag_id}>"
 
 
+def api_key_error_response(error: str) -> str:
+    """Shape a key-resolution failure like every other tool result, so callers see one response shape."""
+    return format_response({"status_code": 0, "body": None, "error": error})
+
+
 def validate_path(file_path: str, must_exist: bool = True) -> tuple[str | None, pathlib.Path | None]:
     """
     Validate and resolve a file path.
@@ -181,8 +258,14 @@ Returns:
 
 {}""".format(REDMINE_REQUEST_INSTRUCTIONS).strip())
     
-def redmine_request(path: str, method: str = 'get', data: dict = None, params: dict = None) -> str:
-    return wrap_insecure_content(format_response(request(path, method=method, data=data, params=params)))
+def redmine_request(path: str, method: str = 'get', data: dict = None, params: dict = None,
+                    ctx: Context | None = None) -> str:
+    api_key, error = resolve_api_key(ctx)
+    if error:
+        return wrap_insecure_content(api_key_error_response(error))
+
+    return wrap_insecure_content(format_response(
+        request(path, method=method, data=data, params=params, api_key=api_key)))
 
 @mcp.tool()
 def redmine_paths_list() -> str:
@@ -214,7 +297,7 @@ def redmine_paths_info(path_templates: list) -> str:
     return format_response(info)
 
 @mcp.tool()
-def redmine_upload(file_path: str, description: str = None) -> str:
+def redmine_upload(file_path: str, description: str = None, ctx: Context | None = None) -> str:
     """
     Upload a file to Redmine and get a token for attachment
 
@@ -226,6 +309,10 @@ def redmine_upload(file_path: str, description: str = None) -> str:
         str: YAML string containing response status code, body and error message
              The body contains the attachment token
     """
+    api_key, error = resolve_api_key(ctx)
+    if error:
+        return api_key_error_response(error)
+
     error, path = validate_path(file_path, must_exist=True)
     if error:
         return format_response({"status_code": 0, "body": None, "error": error})
@@ -239,13 +326,14 @@ def redmine_upload(file_path: str, description: str = None) -> str:
             file_content = f.read()
 
         result = request(path='uploads.json', method='post', params=params,
-                         content_type='application/octet-stream', content=file_content)
+                         content_type='application/octet-stream', content=file_content, api_key=api_key)
         return format_response(result)
     except Exception as e:
         return format_response({"status_code": 0, "body": None, "error": f"{e.__class__.__name__}: {e}"})
 
 @mcp.tool()
-def redmine_download(attachment_id: int, save_path: str, filename: str | None = None) -> str:
+def redmine_download(attachment_id: int, save_path: str, filename: str | None = None,
+                     ctx: Context | None = None) -> str:
     """
     Download an attachment from Redmine and save it to a local file
 
@@ -258,6 +346,10 @@ def redmine_download(attachment_id: int, save_path: str, filename: str | None = 
     Returns:
         str: YAML string containing download status, file path, and any error messages
     """
+    api_key, error = resolve_api_key(ctx)
+    if error:
+        return api_key_error_response(error)
+
     error, path = validate_path(save_path, must_exist=False)
     if error:
         return format_response({"status_code": 0, "body": None, "error": error})
@@ -267,14 +359,14 @@ def redmine_download(attachment_id: int, save_path: str, filename: str | None = 
 
     try:
         if not filename:
-            attachment_response = request(f"attachments/{attachment_id}.json", "get")
+            attachment_response = request(f"attachments/{attachment_id}.json", "get", api_key=api_key)
             if attachment_response["status_code"] != 200:
                 return format_response(attachment_response)
 
             filename = attachment_response["body"]["attachment"]["filename"]
 
         response = request(f"attachments/download/{attachment_id}/{filename}", "get",
-                           content_type="application/octet-stream", raw=True)
+                           content_type="application/octet-stream", raw=True, api_key=api_key)
         if response["status_code"] != 200 or not response["body"]:
             return format_response(response)
 
@@ -292,7 +384,7 @@ def redmine_download(attachment_id: int, save_path: str, filename: str | None = 
 ATTACHMENT_IMAGE_MAX_BYTES = 5 * 1024 * 1024
 
 @mcp.tool()
-def redmine_attachment_image(attachment_id: int) -> Image | str:
+def redmine_attachment_image(attachment_id: int, ctx: Context | None = None) -> Image | str:
     """
     Fetch an image attachment (e.g. an inline screenshot like !screenshot.png!) and return it as viewable
     image content. Use redmine_request on '/issues/{id}.json' with params {'include': 'attachments'} to find
@@ -304,8 +396,12 @@ def redmine_attachment_image(attachment_id: int) -> Image | str:
     Returns:
         Image content on success, or a YAML error string on failure
     """
+    api_key, error = resolve_api_key(ctx)
+    if error:
+        return api_key_error_response(error)
+
     try:
-        attachment_response = request(f"attachments/{attachment_id}.json", "get")
+        attachment_response = request(f"attachments/{attachment_id}.json", "get", api_key=api_key)
         if attachment_response["status_code"] != 200:
             return format_response(attachment_response)
 
@@ -323,7 +419,7 @@ def redmine_attachment_image(attachment_id: int) -> Image | str:
                          "Use redmine_download to save it to disk instead."})
 
         response = request(f"attachments/download/{attachment_id}/{attachment['filename']}", "get",
-                           content_type="application/octet-stream", raw=True)
+                           content_type="application/octet-stream", raw=True, api_key=api_key)
         if response["status_code"] != 200 or not response["body"]:
             return format_response(response)
 
@@ -343,6 +439,11 @@ def main():
     args = parser.parse_args()
 
     if args.transport == "stdio":
+        # stdio carries no request headers, so REDMINE_API_KEY is the only possible source of a key.
+        # Fail here rather than letting every tool call return the same error.
+        if not REDMINE_API_KEY:
+            parser.error("REDMINE_API_KEY is required for the stdio transport (per-user API keys in request "
+                         "headers are only available on the HTTP transports)")
         mcp.run(transport="stdio")
     else:
         mcp.run(transport=args.transport, host=args.host, port=args.port)

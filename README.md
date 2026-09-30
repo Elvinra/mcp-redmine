@@ -124,12 +124,73 @@ mcp-redmine --transport streamable-http --host 0.0.0.0 --port 8000
 mcp-redmine --transport sse --host 0.0.0.0 --port 8000
 ```
 
+### 4. One shared server for a whole team (per-user API keys)
+
+An API key identifies a Redmine *user*, so a single `REDMINE_API_KEY` would make everyone act as the same
+account. Over the HTTP transports each user instead sends their own key in a request header, and the server
+uses it for that request only - so one deployment can serve your whole organization.
+
+Start the server once, with no `REDMINE_API_KEY`:
+
+```bash
+REDMINE_URL=https://redmine.example.com \
+REDMINE_REQUIRE_USER_API_KEY=1 \
+  mcp-redmine --transport streamable-http --host 0.0.0.0 --port 8000
+```
+
+Each user then points their client at it with their own key. In Claude Code:
+
+```bash
+claude mcp add --transport http redmine https://mcp-redmine.example.com/mcp \
+  --header "X-Redmine-API-Key: your-own-api-key"
+```
+
+Or in a `.mcp.json` / `claude_desktop_config.json`:
+
+```json
+  {
+    "mcpServers": {
+      "redmine": {
+        "type": "http",
+        "url": "https://mcp-redmine.example.com/mcp",
+        "headers": {
+          "X-Redmine-API-Key": "your-own-api-key"
+        }
+      }
+    }
+  }
+```
+
+Details:
+
+- `X-Redmine-API-Key` is checked first, then `Authorization` (a `Bearer ` prefix is stripped) for clients
+  that only let you set that header. Change or narrow the list with `REDMINE_API_KEY_HEADERS`.
+- `REDMINE_REQUIRE_USER_API_KEY=1` is recommended for a shared server: without it, a client that forgets the
+  header silently falls back to `REDMINE_API_KEY` and acts as whichever account that key belongs to.
+- `REDMINE_API_KEY` is still the fallback for anyone not sending a header, and remains the only source over
+  stdio, where there are no request headers.
+- Keys travel in an HTTP header, so **serve this over HTTPS** (e.g. behind a reverse proxy). Anyone who can
+  reach the endpoint can use any key they present, so treat it as you would the Redmine API itself.
+- `REDMINE_URL` and every other setting below stay server-wide; only the API key is per-user.
+
+With Docker, pass the transport flags after the image name:
+
+```bash
+docker run -p 8000:8000 \
+  -e REDMINE_URL=https://redmine.example.com \
+  -e REDMINE_REQUIRE_USER_API_KEY=1 \
+  ghcr.io/runekaagaard/mcp-redmine:latest \
+  --transport streamable-http --host 0.0.0.0 --port 8000
+```
+
 ## Environment Variables
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `REDMINE_URL` | Yes | - | URL of your Redmine instance. Subpaths are supported (e.g., `http://localhost/redmine/`) |
-| `REDMINE_API_KEY` | Yes | - | Your Redmine API key (see below for how to get it) |
+| `REDMINE_API_KEY` | Unless per-user | - | Your Redmine API key (see below for how to get it). Used as the fallback when a request carries no per-user key; required for stdio |
+| `REDMINE_API_KEY_HEADERS` | No | `X-Redmine-API-Key,Authorization` | Request headers checked, in order, for the calling user's own API key on the HTTP transports. A `Bearer ` prefix is stripped. See [per-user API keys](#4-one-shared-server-for-a-whole-team-per-user-api-keys) |
+| `REDMINE_REQUIRE_USER_API_KEY` | No | (disabled) | Set to `1` to refuse requests that carry no per-user API key instead of falling back to `REDMINE_API_KEY`. Recommended on a shared multi-user server |
 | `REDMINE_REQUEST_INSTRUCTIONS` | No | - | Path to a file containing additional instructions for the redmine_request tool. I've found it works great to have the LLM generate that file after a session. ([example1](INSTRUCTIONS_EXAMPLE1.md) [example2](INSTRUCTIONS_EXAMPLE2.md)) |
 | `REDMINE_HEADERS` | No | (empty) | Custom HTTP headers to include in all requests. Format: `"Header1: Value1, Header2: Value2"`. Useful for proxies that require additional authentication (e.g., `X-Redmine-Username`) |
 | `REDMINE_RESPONSE_FORMAT` | No | `yaml` | Response format: `yaml` or `json`. Controls how API responses are formatted |
